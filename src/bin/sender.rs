@@ -110,6 +110,9 @@ impl Session {
     fn net(&mut self, line: &str) {
         let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
         match cmd {
+            "ALGO" => {
+                println!("\nchannel switched to {}", rest);
+            }
             "HOSTS" => {
                 self.waiting = false;
                 for h in rest.split_whitespace() {
@@ -262,13 +265,10 @@ fn main() {
         println!("port {} is busy, using {}", port, my_port);
     }
 
-    print!("channel password: ");
-    io::stdout().flush().unwrap();
-    let mut password = String::new();
-    io::stdin().read_line(&mut password).unwrap();
+    let password = netchat::password::read_masked("channel password: ").unwrap_or_default();
 
     let mut out = stream.try_clone().unwrap();
-    writeln!(out, "{}", password.trim()).unwrap();
+    writeln!(out, "{}", password).unwrap();
     let mut reader = BufReader::new(stream);
     let mut reply = String::new();
     reader.read_line(&mut reply).unwrap_or(0);
@@ -276,7 +276,16 @@ fn main() {
         println!("wrong password, rejected by channel");
         process::exit(1);
     };
-    println!("joined the channel as {}, type help to see commands", me);
+    let mut algorithm = String::new();
+    reader.read_line(&mut algorithm).unwrap_or(0);
+    let algorithm = algorithm
+        .trim()
+        .strip_prefix("ALGO ")
+        .unwrap_or("unknown");
+    println!(
+        "joined the channel as {} using {}, type help to see commands",
+        me, algorithm
+    );
 
     let (tx, rx) = mpsc::channel();
     let net_tx = tx.clone();
