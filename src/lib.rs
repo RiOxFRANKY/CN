@@ -1,3 +1,3 @@
-pub mod csma;
+pub mod cdma;
 pub mod password;
-pub mod stats;
+pub mod walsh;

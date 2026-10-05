@@ -1,5 +1,4 @@
-use netchat::csma::{Algorithm, Medium};
-use netchat::stats::analyze;
+use netchat::{cdma, walsh};
 use std::collections::HashMap;
 use std::env;
 #[cfg(windows)]
@@ -8,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{self, Command};
+use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -50,6 +49,8 @@ struct Bus {
     hosts: HashMap<String, TcpStream>,
     peers: HashMap<String, String>,
     requests: HashMap<String, String>,
+    codes: HashMap<String, Vec<i8>>,
+    generation: u64,
     logger: Logger,
 }
 
@@ -59,19 +60,42 @@ impl Bus {
             hosts: HashMap::new(),
             peers: HashMap::new(),
             requests: HashMap::new(),
+            codes: HashMap::new(),
+            generation: 0,
             logger,
         }
     }
 
-    fn send(&mut self, to: &str, msg: &str) {
+    fn send(&mut self, to: &str, message: &str) {
         if let Some(stream) = self.hosts.get_mut(to) {
-            let _ = writeln!(stream, "{}", msg);
+            let _ = writeln!(stream, "{}", message);
         }
     }
 
-    fn broadcast(&mut self, msg: &str) {
-        for stream in self.hosts.values_mut() {
-            let _ = writeln!(stream, "{}", msg);
+    fn refresh_codes(&mut self) {
+        let mut names: Vec<String> = self.hosts.keys().cloned().collect();
+        names.sort();
+        let generated = walsh::codes(names.len());
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.codes.clear();
+        let mut updates = Vec::new();
+        for (name, code) in names.into_iter().zip(generated) {
+            updates.push((
+                name.clone(),
+                format!("CODE {} {}", self.generation, walsh::format(&code)),
+            ));
+            self.codes.insert(name, code);
+        }
+        for (name, message) in updates {
+            self.send(&name, &message);
+            if let Some(code) = self.codes.get(&name) {
+                self.logger.write(&format!(
+                    "{} assigned Walsh code {} in generation {}",
+                    name,
+                    walsh::display(code),
+                    self.generation
+                ));
+            }
         }
     }
 
@@ -99,6 +123,7 @@ impl Bus {
 
     fn leave(&mut self, me: &str) {
         self.hosts.remove(me);
+        self.codes.remove(me);
         let mut others = Vec::new();
         if let Some(peer) = self.peers.remove(me) {
             self.peers.remove(&peer);
@@ -120,6 +145,7 @@ impl Bus {
             self.send(&other, &format!("LEFT {}", me));
         }
         self.logger.write(&format!("{} left the channel", me));
+        self.refresh_codes();
     }
 
     fn close(&mut self) {
@@ -127,24 +153,29 @@ impl Bus {
             let _ = stream.shutdown(Shutdown::Both);
         }
         self.hosts.clear();
+        self.codes.clear();
     }
 }
 
 struct Server {
     stop: Arc<AtomicBool>,
     bus: Arc<Mutex<Bus>>,
-    algorithm: Arc<Mutex<Algorithm>>,
     thread: Option<JoinHandle<()>>,
     port: u16,
 }
 
 impl Server {
-    fn switch(&self, algorithm: Algorithm) {
-        *self.algorithm.lock().unwrap() = algorithm;
-        if let Ok(mut bus) = self.bus.lock() {
-            bus.broadcast(&format!("ALGO {}", algorithm));
-            bus.logger
-                .write(&format!("channel switched to {}", algorithm));
+    fn show_codes(&self) {
+        let bus = self.bus.lock().unwrap();
+        if bus.codes.is_empty() {
+            println!("no authenticated senders");
+            return;
+        }
+        println!("Walsh generation {}", bus.generation);
+        let mut names: Vec<&String> = bus.codes.keys().collect();
+        names.sort();
+        for name in names {
+            println!("{} {}", name, walsh::display(&bus.codes[name]));
         }
     }
 
@@ -166,10 +197,9 @@ fn main() {
         eprintln!("could not create channel.log: {}", error);
         process::exit(1);
     });
-    let mut algorithm = None;
     let mut password = String::new();
     let mut server: Option<Server> = None;
-    println!("channel shell, type help");
+    println!("CDMA channel shell, type help");
 
     loop {
         print!("channel> ");
@@ -178,49 +208,16 @@ fn main() {
         if io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
             break;
         }
-        let mut parts = line.split_whitespace();
-        match parts.next() {
-            Some("help") => show_help(),
-            Some("show") if parts.next() == Some("all") => show_algorithms(algorithm),
-            Some("stats") => show_statistics(Algorithm::all()),
-            Some("stat") => {
-                let value = parts.collect::<Vec<_>>().join(" ");
-                match Algorithm::parse(&value) {
-                    Some(selected) => show_statistics([selected]),
-                    None => println!("algorithm not found, type show all"),
-                }
-            }
-            Some("test") => run_tests(),
-            Some("switch") => {
-                let value = parts.collect::<Vec<_>>().join(" ");
-                match Algorithm::parse(&value) {
-                    Some(selected) => {
-                        algorithm = Some(selected);
-                        if let Some(active) = &server {
-                            active.switch(selected);
-                            println!("channel switched to {}", selected);
-                        } else {
-                            println!("using {} for the next start", selected);
-                        }
-                    }
-                    None => println!("algorithm not found, type show all"),
-                }
-            }
-            Some("use") => {
-                if server.is_some() {
-                    println!("use switch <name or number> while the channel is running");
+        match line.trim() {
+            "help" => show_help(),
+            "codes" => {
+                if let Some(active) = &server {
+                    active.show_codes();
                 } else {
-                    let value = parts.collect::<Vec<_>>().join(" ");
-                    match Algorithm::parse(&value) {
-                        Some(selected) => {
-                            algorithm = Some(selected);
-                            println!("using {}", selected);
-                        }
-                        None => println!("algorithm not found, type show all"),
-                    }
+                    println!("channel is not running");
                 }
             }
-            Some("password") => {
+            "password" => {
                 if server.is_some() {
                     println!("stop the channel before changing the password");
                 } else if let Some(value) = masked_password() {
@@ -232,27 +229,22 @@ fn main() {
                     }
                 }
             }
-            Some("start") => {
+            "start" => {
                 if let Some(active) = &server {
                     println!("channel is already open on port {}", active.port);
                 } else if password.is_empty() {
                     println!("set a password first");
-                } else if let Some(selected) = algorithm {
-                    match start_server(port, selected, password.clone(), logger.clone()) {
+                } else {
+                    match start_server(port, password.clone(), logger.clone()) {
                         Ok(started) => {
-                            println!(
-                                "channel opened on port {} using {}",
-                                started.port, selected
-                            );
+                            println!("CDMA channel opened on port {}", started.port);
                             server = Some(started);
                         }
                         Err(error) => println!("{}", error),
                     }
-                } else {
-                    println!("choose an algorithm first, type show all");
                 }
             }
-            Some("stop") => {
+            "stop" => {
                 if let Some(mut active) = server.take() {
                     active.close();
                     println!("channel stopped");
@@ -260,10 +252,10 @@ fn main() {
                     println!("channel is not running");
                 }
             }
-            Some("logs") => show_logs(&logger.path),
-            Some("exit") => break,
-            Some(command) => println!("unknown command '{}', type help", command),
-            None => {}
+            "logs" => show_logs(&logger.path),
+            "exit" => break,
+            "" => {}
+            command => println!("unknown command '{}', type help", command),
         }
     }
 
@@ -275,12 +267,12 @@ fn main() {
 }
 
 fn read_port() -> u16 {
-    let args: Vec<String> = env::args().collect();
-    if args.len() == 1 {
+    let arguments: Vec<String> = env::args().collect();
+    if arguments.len() == 1 {
         return 9000;
     }
-    if args.len() == 3 && args[1] == "-p" {
-        return args[2].parse().unwrap_or_else(|_| usage());
+    if arguments.len() == 3 && arguments[1] == "-p" {
+        return arguments[2].parse().unwrap_or_else(|_| usage());
     }
     usage()
 }
@@ -291,61 +283,13 @@ fn usage() -> ! {
 }
 
 fn show_help() {
-    println!("help                 show all commands");
-    println!("show all             show available algorithms");
-    println!("use <name or number> choose an algorithm");
-    println!("switch <name or number> change the running algorithm");
-    println!("stats                show statistics for all algorithms");
-    println!("stat <name or number> show statistics for one algorithm");
-    println!("test                 run all tests");
-    println!("password             set the channel password");
-    println!("start                open the channel");
-    println!("stop                 stop the channel, keep the shell open");
-    println!("logs                 follow logs, Ctrl+C returns here");
-    println!("exit                 close the channel");
-}
-
-fn show_algorithms(selected: Option<Algorithm>) {
-    for (index, algorithm) in Algorithm::all().into_iter().enumerate() {
-        if selected == Some(algorithm) {
-            println!("{}. {} (selected)", index + 1, algorithm);
-        } else {
-            println!("{}. {}", index + 1, algorithm);
-        }
-    }
-}
-
-fn show_statistics<const N: usize>(algorithms: [Algorithm; N]) {
-    for algorithm in algorithms {
-        println!();
-        println!("{}", algorithm);
-        println!(
-            "{:<10} {:<12} {:<18} {:<12}",
-            "stations", "collisions", "avg delay (ms)", "throughput (%)"
-        );
-        for result in analyze(algorithm) {
-            println!(
-                "{:<10} {:<12} {:<18.2} {:<12.2}",
-                result.stations,
-                result.collisions,
-                result.average_delay_ms,
-                result.throughput_percent
-            );
-        }
-    }
-}
-
-fn run_tests() {
-    println!("running tests...");
-    match Command::new("cargo")
-        .arg("test")
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .status()
-    {
-        Ok(status) if status.success() => println!("all tests passed"),
-        Ok(_) => println!("tests failed"),
-        Err(error) => println!("could not run tests: {}", error),
-    }
+    println!("help       show all commands");
+    println!("password   set the channel password");
+    println!("start      open the CDMA channel");
+    println!("stop       stop the channel, keep the shell open");
+    println!("codes      show current sender Walsh codes");
+    println!("logs       follow logs, Ctrl+C returns here");
+    println!("exit       close the channel shell");
 }
 
 fn masked_password() -> Option<String> {
@@ -489,23 +433,16 @@ fn nearby(port: u16) -> Vec<u16> {
 
 fn start_server(
     requested_port: u16,
-    algorithm: Algorithm,
     password: String,
     logger: Logger,
 ) -> Result<Server, String> {
     let (listener, port) = bind_near(requested_port)?;
     let stop = Arc::new(AtomicBool::new(false));
     let bus = Arc::new(Mutex::new(Bus::new(logger.clone())));
-    let medium = Arc::new(Medium::new());
-    let current_algorithm = Arc::new(Mutex::new(algorithm));
     let thread_stop = stop.clone();
     let thread_bus = bus.clone();
-    let thread_algorithm = current_algorithm.clone();
     let thread = thread::spawn(move || {
-        logger.write(&format!(
-            "channel opened on port {} using {}",
-            port, algorithm
-        ));
+        logger.write(&format!("CDMA channel opened on port {}", port));
         while !thread_stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -514,13 +451,9 @@ fn start_server(
                         continue;
                     }
                     let bus = thread_bus.clone();
-                    let medium = medium.clone();
                     let password = password.clone();
                     let logger = logger.clone();
-                    let algorithm = thread_algorithm.clone();
-                    thread::spawn(move || {
-                        handle(stream, bus, password, algorithm, medium, logger)
-                    });
+                    thread::spawn(move || handle(stream, bus, password, logger));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));
@@ -535,20 +468,12 @@ fn start_server(
     Ok(Server {
         stop,
         bus,
-        algorithm: current_algorithm,
         thread: Some(thread),
         port,
     })
 }
 
-fn handle(
-    stream: TcpStream,
-    bus: Arc<Mutex<Bus>>,
-    password: String,
-    algorithm: Arc<Mutex<Algorithm>>,
-    medium: Arc<Medium>,
-    logger: Logger,
-) {
+fn handle(stream: TcpStream, bus: Arc<Mutex<Bus>>, password: String, logger: Logger) {
     let Ok(address) = stream.peer_addr() else {
         return;
     };
@@ -563,31 +488,21 @@ fn handle(
         logger.write(&format!("{} entered wrong password, rejected", me));
         return;
     }
-    let selected = *algorithm.lock().unwrap();
     let _ = writeln!(output, "OK {}", me);
-    let _ = writeln!(output, "ALGO {}", selected);
-    bus.lock().unwrap().hosts.insert(me.clone(), output);
-    logger.write(&format!("{} joined using {}", me, selected));
+    {
+        let mut bus = bus.lock().unwrap();
+        bus.hosts.insert(me.clone(), output);
+        bus.refresh_codes();
+    }
+    logger.write(&format!("{} joined the CDMA channel", me));
 
     for line in lines {
         let Ok(line) = line else {
             break;
         };
         let (command, argument) = line.split_once(' ').unwrap_or((&line, ""));
-        if command == "MSG" {
-            let selected = *algorithm.lock().unwrap();
-            let (_access, report) = medium.acquire(selected);
-            logger.write(&format!(
-                "{} got channel with {} after {} attempt(s), {} collision(s), {} ms wait",
-                me, selected, report.attempts, report.collisions, report.waited_ms
-            ));
-            thread::sleep(Duration::from_millis(30));
-            let mut bus = bus.lock().unwrap();
-            if let Some(peer) = bus.peers.get(&me).cloned() {
-                bus.send(&peer, &format!("MSG {} {}", me, argument));
-                bus.logger
-                    .write(&format!("{} sent message to {}", me, peer));
-            }
+        if command == "SIGNAL" {
+            handle_signal(&me, argument, &bus);
             continue;
         }
 
@@ -657,4 +572,45 @@ fn handle(
         }
     }
     bus.lock().unwrap().leave(&me);
+}
+
+fn handle_signal(me: &str, argument: &str, bus: &Arc<Mutex<Bus>>) {
+    let Some((generation_text, encoded)) = argument.split_once(' ') else {
+        bus.lock().unwrap().send(me, "ERR invalid CDMA signal");
+        return;
+    };
+    let Ok(generation) = generation_text.parse::<u64>() else {
+        bus.lock().unwrap().send(me, "ERR invalid Walsh generation");
+        return;
+    };
+    let Some(signal) = cdma::parse_signal(encoded) else {
+        bus.lock().unwrap().send(me, "ERR invalid CDMA signal");
+        return;
+    };
+    let mut bus = bus.lock().unwrap();
+    if generation != bus.generation {
+        bus.send(me, "ERR Walsh code changed, send the message again");
+        return;
+    }
+    let Some(code) = bus.codes.get(me).cloned() else {
+        bus.send(me, "ERR no Walsh code assigned");
+        return;
+    };
+    let text = match cdma::decode_text(&signal, &code) {
+        Ok(text) => text,
+        Err(error) => {
+            bus.send(me, &format!("ERR {}", error));
+            return;
+        }
+    };
+    if let Some(peer) = bus.peers.get(me).cloned() {
+        bus.send(&peer, &format!("MSG {} {}", me, text));
+        bus.logger.write(&format!(
+            "{} sent {} CDMA chips to {} using Walsh code {}",
+            me,
+            signal.len(),
+            peer,
+            walsh::display(&code)
+        ));
+    }
 }

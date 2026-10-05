@@ -1,3 +1,4 @@
+use netchat::{cdma, walsh};
 use socket2::{Domain, Socket, Type};
 use std::env;
 use std::io::{self, BufRead, BufReader, Write};
@@ -20,6 +21,8 @@ struct Session {
     asked_by: Option<String>,
     close_by: Option<String>,
     waiting: bool,
+    code_generation: u64,
+    code: Vec<i8>,
 }
 
 impl Session {
@@ -78,7 +81,12 @@ impl Session {
             } else if !self.my_turn {
                 println!("half duplex: wait for {} to reply", p);
             } else if !line.is_empty() {
-                self.send(&format!("MSG {}", line));
+                let signal = cdma::encode_text(line, &self.code);
+                self.send(&format!(
+                    "SIGNAL {} {}",
+                    self.code_generation,
+                    cdma::format_signal(&signal)
+                ));
                 self.my_turn = false;
             }
             return;
@@ -110,8 +118,16 @@ impl Session {
     fn net(&mut self, line: &str) {
         let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
         match cmd {
-            "ALGO" => {
-                println!("\nchannel switched to {}", rest);
+            "CODE" => {
+                if let Some((generation, code)) = parse_assignment(rest) {
+                    self.code_generation = generation;
+                    self.code = code;
+                    println!(
+                        "\nWalsh code changed to {} in generation {}",
+                        walsh::display(&self.code),
+                        self.code_generation
+                    );
+                }
             }
             "HOSTS" => {
                 self.waiting = false;
@@ -172,6 +188,9 @@ impl Session {
             }
             "ERR" => {
                 self.waiting = false;
+                if self.peer.is_some() {
+                    self.my_turn = true;
+                }
                 println!("{}", rest);
             }
             _ => {}
@@ -198,6 +217,11 @@ fn answer(line: &str) -> Option<bool> {
         "n" | "no" => Some(false),
         _ => None,
     }
+}
+
+fn parse_assignment(value: &str) -> Option<(u64, Vec<i8>)> {
+    let (generation, code) = value.split_once(' ')?;
+    Some((generation.parse().ok()?, walsh::parse(code)?))
 }
 
 fn usage() -> ! {
@@ -276,15 +300,20 @@ fn main() {
         println!("wrong password, rejected by channel");
         process::exit(1);
     };
-    let mut algorithm = String::new();
-    reader.read_line(&mut algorithm).unwrap_or(0);
-    let algorithm = algorithm
+    let mut assignment = String::new();
+    reader.read_line(&mut assignment).unwrap_or(0);
+    let Some((code_generation, code)) = assignment
         .trim()
-        .strip_prefix("ALGO ")
-        .unwrap_or("unknown");
+        .strip_prefix("CODE ")
+        .and_then(parse_assignment)
+    else {
+        println!("channel did not assign a Walsh code");
+        process::exit(1);
+    };
     println!(
-        "joined the channel as {} using {}, type help to see commands",
-        me, algorithm
+        "joined the CDMA channel as {} with Walsh code {}, type help to see commands",
+        me,
+        walsh::display(&code)
     );
 
     let (tx, rx) = mpsc::channel();
@@ -316,6 +345,8 @@ fn main() {
         asked_by: None,
         close_by: None,
         waiting: false,
+        code_generation,
+        code,
     };
     session.prompt();
     for event in rx {
