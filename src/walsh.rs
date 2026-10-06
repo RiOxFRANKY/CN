@@ -43,3 +43,7 @@ pub fn parse(value: &str) -> Option<Vec<i8>> {
 pub fn display(code: &[i8]) -> String {
     format!("[{}]", format(code).replace(',', " "))
 }
+
+pub fn resize(code: &[i8], length: usize) -> Vec<i8> {
+    code.iter().cycle().take(length).copied().collect()
+}

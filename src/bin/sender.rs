@@ -37,7 +37,12 @@ impl Session {
                 _ if self.current.is_some() => println!("exchanging Walsh codes, wait"),
                 _ => {
                     let signal = cdma::encode_text(line, &self.code);
-                    self.send(&format!("SIGNAL {}", cdma::format_signal(&signal)));
+                    let message = format!(
+                        "SIGNAL {} {}",
+                        self.code.len(),
+                        cdma::format_signal(&signal)
+                    );
+                    self.send(&message);
                 }
             }
             return;
@@ -135,6 +140,23 @@ impl Session {
                 );
                 self.exchange();
             }
+            "ORDER" => {
+                let Ok(order) = rest.parse::<usize>() else {
+                    return;
+                };
+                if self.group.is_none() {
+                    return;
+                }
+                self.code = walsh::resize(&self.code, order);
+                for code in self.keys.values_mut() {
+                    *code = walsh::resize(code, order);
+                }
+                println!(
+                    "\rWalsh code length changed to {}, my code is now {}",
+                    order,
+                    walsh::display(&self.code)
+                );
+            }
             "HELLO" => {
                 let Some((from, code)) = rest.split_once(' ') else {
                     return;
@@ -142,6 +164,7 @@ impl Session {
                 let Some(code) = walsh::parse(code) else {
                     return;
                 };
+                let code = walsh::resize(&code, self.code.len());
                 println!(
                     "\rreceived Walsh code {} from {}",
                     walsh::display(&code),
@@ -159,6 +182,7 @@ impl Session {
                 let Some(code) = walsh::parse(code) else {
                     return;
                 };
+                let code = walsh::resize(&code, self.code.len());
                 if self.current.as_deref() == Some(from) {
                     println!(
                         "received Walsh code {} from {}",

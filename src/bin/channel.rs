@@ -45,12 +45,17 @@ impl Logger {
     }
 }
 
-const GROUP_SIZE: usize = 8;
-
 struct Group {
     owner: String,
-    members: HashMap<String, Vec<i8>>,
+    members: HashMap<String, usize>,
+    order: usize,
     exchanging: Option<String>,
+}
+
+impl Group {
+    fn code(&self, member: &str) -> Vec<i8> {
+        walsh::codes(self.order).swap_remove(self.members[member])
+    }
 }
 
 struct Bus {
@@ -94,15 +99,14 @@ impl Bus {
         }
         self.next_group += 1;
         let id = self.next_group;
-        let code = walsh::codes(GROUP_SIZE).remove(0);
-        self.groups.insert(
-            id,
-            Group {
-                owner: me.to_string(),
-                members: HashMap::from([(me.to_string(), code.clone())]),
-                exchanging: Some(me.to_string()),
-            },
-        );
+        let group = Group {
+            owner: me.to_string(),
+            members: HashMap::from([(me.to_string(), 0)]),
+            order: 1,
+            exchanging: Some(me.to_string()),
+        };
+        let code = group.code(me);
+        self.groups.insert(id, group);
         self.joined.insert(me.to_string(), id);
         self.send(me, &format!("JOINED {} {}", id, walsh::format(&code)));
         self.logger.write(&format!(
@@ -140,18 +144,16 @@ impl Bus {
             );
             return;
         }
-        let Some(code) = walsh::codes(GROUP_SIZE)
-            .into_iter()
-            .find(|code| !group.members.values().any(|used| used == code))
-        else {
-            self.send(me, &format!("ERR group {} is full", id));
-            return;
-        };
+        let slot = (0..)
+            .find(|slot| !group.members.values().any(|used| used == slot))
+            .unwrap();
         let mut others: Vec<String> = group.members.keys().cloned().collect();
         others.sort();
-        group.members.insert(me.to_string(), code.clone());
+        group.members.insert(me.to_string(), slot);
         group.exchanging = Some(me.to_string());
         self.joined.insert(me.to_string(), id);
+        self.reorder(id);
+        let code = self.groups[&id].code(me);
         self.send(
             me,
             &format!(
@@ -166,6 +168,29 @@ impl Bus {
             me,
             id,
             walsh::display(&code)
+        ));
+    }
+
+    fn reorder(&mut self, id: u32) {
+        let Some(group) = self.groups.get_mut(&id) else {
+            return;
+        };
+        let order = group
+            .members
+            .values()
+            .max()
+            .map_or(1, |slot| (slot + 1).next_power_of_two());
+        if order == group.order {
+            return;
+        }
+        group.order = order;
+        let members: Vec<String> = group.members.keys().cloned().collect();
+        for member in members {
+            self.send(&member, &format!("ORDER {}", order));
+        }
+        self.logger.write(&format!(
+            "group {} Walsh code length changed to {}",
+            id, order
         ));
     }
 
@@ -207,10 +232,25 @@ impl Bus {
             self.send(me, "ERR you are not in a group");
             return;
         };
-        let Some(signal) = cdma::parse_signal(argument) else {
+        let Some((order, chips)) = argument.split_once(' ') else {
             self.send(me, "ERR invalid CDMA signal");
             return;
         };
+        let Some(signal) = cdma::parse_signal(chips) else {
+            self.send(me, "ERR invalid CDMA signal");
+            return;
+        };
+        let current = self.groups[&id].order;
+        if order.parse::<usize>().ok() != Some(current) {
+            self.send(
+                me,
+                &format!(
+                    "ERR Walsh code length changed to {}, send the message again",
+                    current
+                ),
+            );
+            return;
+        }
         let others: Vec<String> = self.groups[&id]
             .members
             .keys()
@@ -218,7 +258,7 @@ impl Bus {
             .cloned()
             .collect();
         for other in others {
-            self.send(&other, &format!("SIGNAL {}", argument));
+            self.send(&other, &format!("SIGNAL {}", chips));
         }
         self.logger.write(&format!(
             "{} sent {} CDMA chips to group {}",
@@ -249,6 +289,7 @@ impl Bus {
                 self.send(&other, &format!("GONE {}", me));
             }
             self.logger.write(&format!("{} left group {}", me, id));
+            self.reorder(id);
         }
         Some(id)
     }
@@ -284,11 +325,14 @@ impl Server {
             return;
         }
         for (id, group) in &bus.groups {
-            println!("group {} owner {}", id, group.owner);
+            println!(
+                "group {} owner {} code length {}",
+                id, group.owner, group.order
+            );
             let mut names: Vec<&String> = group.members.keys().collect();
             names.sort();
             for name in names {
-                println!("  {} {}", name, walsh::display(&group.members[name]));
+                println!("  {} {}", name, walsh::display(&group.code(name)));
             }
         }
     }
