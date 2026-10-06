@@ -5,7 +5,7 @@ use std::env;
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -314,6 +314,7 @@ struct Server {
     stop: Arc<AtomicBool>,
     bus: Arc<Mutex<Bus>>,
     thread: Option<JoinHandle<()>>,
+    ip: IpAddr,
     port: u16,
 }
 
@@ -395,7 +396,7 @@ fn main() {
                 } else {
                     match start_server(port, password.clone(), logger.clone()) {
                         Ok(started) => {
-                            println!("CDMA channel opened on port {}", started.port);
+                            println!("CDMA channel opened on {}:{}", started.ip, started.port);
                             server = Some(started);
                         }
                         Err(error) => println!("{}", error),
@@ -595,12 +596,17 @@ fn start_server(
     logger: Logger,
 ) -> Result<Server, String> {
     let (listener, port) = bind_near(requested_port)?;
+    let ip = local_ip();
     let stop = Arc::new(AtomicBool::new(false));
+    if let Ok(socket) = UdpSocket::bind(("0.0.0.0", port)) {
+        let stop = stop.clone();
+        thread::spawn(move || answer_discovery(socket, port, stop));
+    }
     let bus = Arc::new(Mutex::new(Bus::new(logger.clone())));
     let thread_stop = stop.clone();
     let thread_bus = bus.clone();
     let thread = thread::spawn(move || {
-        logger.write(&format!("CDMA channel opened on port {}", port));
+        logger.write(&format!("CDMA channel opened on {}:{}", ip, port));
         while !thread_stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -611,7 +617,7 @@ fn start_server(
                     let bus = thread_bus.clone();
                     let password = password.clone();
                     let logger = logger.clone();
-                    thread::spawn(move || handle(stream, bus, password, logger));
+                    thread::spawn(move || handle(stream, bus, password, logger, ip));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));
@@ -627,14 +633,40 @@ fn start_server(
         stop,
         bus,
         thread: Some(thread),
+        ip,
         port,
     })
 }
 
-fn handle(stream: TcpStream, bus: Arc<Mutex<Bus>>, password: String, logger: Logger) {
-    let Ok(address) = stream.peer_addr() else {
+fn local_ip() -> IpAddr {
+    UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("8.8.8.8:80")?;
+            socket.local_addr()
+        })
+        .map(|address| address.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+fn answer_discovery(socket: UdpSocket, port: u16, stop: Arc<AtomicBool>) {
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut buffer = [0u8; 64];
+    while !stop.load(Ordering::Acquire) {
+        if let Ok((size, from)) = socket.recv_from(&mut buffer)
+            && &buffer[..size] == b"CDMA?"
+        {
+            let _ = socket.send_to(format!("CDMA {}", port).as_bytes(), from);
+        }
+    }
+}
+
+fn handle(stream: TcpStream, bus: Arc<Mutex<Bus>>, password: String, logger: Logger, ip: IpAddr) {
+    let Ok(mut address) = stream.peer_addr() else {
         return;
     };
+    if address.ip().is_loopback() {
+        address = SocketAddr::new(ip, address.port());
+    }
     let me = address.to_string();
     let Ok(mut output) = stream.try_clone() else {
         return;

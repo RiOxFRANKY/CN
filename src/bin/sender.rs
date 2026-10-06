@@ -3,10 +3,11 @@ use socket2::{Domain, Socket, Type};
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 enum Event {
     Input(String),
@@ -264,16 +265,29 @@ fn open(server: SocketAddr, port: u16) -> io::Result<TcpStream> {
     Err(io::Error::new(io::ErrorKind::AddrInUse, "no free port found"))
 }
 
+fn discover(channel_port: u16) -> Option<SocketAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.set_broadcast(true).ok()?;
+    socket.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    let _ = socket.send_to(b"CDMA?", ("255.255.255.255", channel_port));
+    let _ = socket.send_to(b"CDMA?", ("127.0.0.1", channel_port));
+    let mut buffer = [0u8; 64];
+    let (size, from) = socket.recv_from(&mut buffer).ok()?;
+    let reply = std::str::from_utf8(&buffer[..size]).ok()?;
+    let port = reply.strip_prefix("CDMA ")?.parse().ok()?;
+    Some(SocketAddr::new(from.ip(), port))
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let mut ip = String::from("127.0.0.1");
+    let mut ip = None;
     let mut port = 0;
     let mut channel_port = 9000;
     let mut i = 1;
     while i < args.len() {
         let Some(val) = args.get(i + 1) else { usage() };
         match args[i].as_str() {
-            "-i" => ip = val.clone(),
+            "-i" => ip = Some(val.clone()),
             "-p" => port = val.parse().unwrap_or_else(|_| usage()),
             "-c" => channel_port = val.parse().unwrap_or_else(|_| usage()),
             _ => usage(),
@@ -281,14 +295,24 @@ fn main() {
         i += 2;
     }
 
-    let server = (ip.as_str(), channel_port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.find(|a| a.is_ipv4()))
-        .unwrap_or_else(|| {
-            eprintln!("invalid ip {}", ip);
+    let server = match ip {
+        Some(ip) => (ip.as_str(), channel_port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.find(|a| a.is_ipv4()))
+            .unwrap_or_else(|| {
+                eprintln!("invalid ip {}", ip);
+                process::exit(1);
+            }),
+        None => discover(channel_port).unwrap_or_else(|| {
+            eprintln!(
+                "no channel found on port {}, use -i channel_ip",
+                channel_port
+            );
             process::exit(1);
-        });
+        }),
+    };
+    println!("channel found at {}", server);
 
     let stream = open(server, port).unwrap_or_else(|e| {
         eprintln!("could not connect to channel at {}: {}", server, e);
