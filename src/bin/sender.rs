@@ -1,5 +1,6 @@
 use netchat::{cdma, walsh};
 use socket2::{Domain, Socket, Type};
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -15,14 +16,11 @@ enum Event {
 
 struct Session {
     out: TcpStream,
-    me: String,
-    peer: Option<String>,
-    my_turn: bool,
-    asked_by: Option<String>,
-    close_by: Option<String>,
-    waiting: bool,
-    code_generation: u64,
+    group: Option<u32>,
     code: Vec<i8>,
+    keys: BTreeMap<String, Vec<i8>>,
+    pending: VecDeque<String>,
+    current: Option<String>,
 }
 
 impl Session {
@@ -31,63 +29,16 @@ impl Session {
     }
 
     fn input(&mut self, line: &str) {
-        if let Some(from) = self.asked_by.clone() {
-            match answer(line) {
-                Some(true) => {
-                    self.send("ACCEPT");
-                    self.asked_by = None;
-                    println!("--- chat with {} (type exit to close) ---", from);
-                    println!("waiting for {} to speak first", from);
-                    self.peer = Some(from);
-                    self.my_turn = false;
+        if self.group.is_some() {
+            match line {
+                "" => {}
+                "leave" => self.send("LEAVE"),
+                "keys" => self.show_keys(),
+                _ if self.current.is_some() => println!("exchanging Walsh codes, wait"),
+                _ => {
+                    let signal = cdma::encode_text(line, &self.code);
+                    self.send(&format!("SIGNAL {}", cdma::format_signal(&signal)));
                 }
-                Some(false) => {
-                    self.send("REJECT");
-                    self.asked_by = None;
-                }
-                None => println!("press y or n"),
-            }
-            return;
-        }
-
-        if self.close_by.is_some() {
-            match answer(line) {
-                Some(true) => {
-                    self.send("CLOSEYES");
-                    self.close_by = None;
-                    if let Some(p) = self.peer.take() {
-                        println!("--- connection with {} closed ---", p);
-                    }
-                }
-                Some(false) => {
-                    self.send("CLOSENO");
-                    self.close_by = None;
-                }
-                None => println!("press y or n"),
-            }
-            return;
-        }
-
-        if self.waiting {
-            println!("waiting for response...");
-            return;
-        }
-
-        if let Some(p) = self.peer.clone() {
-            if line == "exit" {
-                self.send("EXIT");
-                self.waiting = true;
-                println!("asked {} to close the connection", p);
-            } else if !self.my_turn {
-                println!("half duplex: wait for {} to reply", p);
-            } else if !line.is_empty() {
-                let signal = cdma::encode_text(line, &self.code);
-                self.send(&format!(
-                    "SIGNAL {} {}",
-                    self.code_generation,
-                    cdma::format_signal(&signal)
-                ));
-                self.my_turn = false;
             }
             return;
         }
@@ -95,133 +46,168 @@ impl Session {
         let mut parts = line.split_whitespace();
         match parts.next() {
             Some("help") => {
-                println!("help              show commands");
-                println!("hosts             show connected hosts");
-                println!("connect <host>    send connection request to a host");
+                println!("help                     show commands");
+                println!("hosts                    show connected hosts");
+                println!("groups                   show open groups");
+                println!("create                   open a new group chat");
+                println!("join <no|owner ip:port>  join a group chat");
             }
-            Some("hosts") => {
-                self.send("HOSTS");
-                self.waiting = true;
-            }
-            Some("connect") => match parts.next() {
-                Some(host) => {
-                    self.send(&format!("CONNECT {}", host));
-                    self.waiting = true;
-                }
-                None => println!("usage: connect <host_ip:port>"),
+            Some("hosts") => self.send("HOSTS"),
+            Some("groups") => self.send("GROUPS"),
+            Some("create") => self.send("CREATE"),
+            Some("join") => match parts.find(|part| *part != "group") {
+                Some(target) => self.send(&format!("JOIN {}", target)),
+                None => println!("usage: join <group_no|owner_ip:port>"),
             },
             Some(cmd) => println!("unknown command '{}', type help", cmd),
             None => {}
         }
     }
 
+    fn exchange(&mut self) {
+        self.current = self.pending.pop_front();
+        match self.current.clone() {
+            Some(host) => {
+                println!("sending my Walsh code to {}", host);
+                let message = format!("HELLO {} {}", host, walsh::format(&self.code));
+                self.send(&message);
+            }
+            None => {
+                self.send("READY");
+                println!("Walsh code exchange finished, chat is full duplex now");
+                println!("type a message to send, keys to show codes, leave to exit the group");
+                self.show_keys();
+            }
+        }
+    }
+
+    fn show_keys(&self) {
+        println!("you {}", walsh::display(&self.code));
+        for (host, code) in &self.keys {
+            println!("{} {}", host, walsh::display(code));
+        }
+    }
+
+    fn reset(&mut self) {
+        self.group = None;
+        self.code.clear();
+        self.keys.clear();
+        self.pending.clear();
+        self.current = None;
+    }
+
     fn net(&mut self, line: &str) {
         let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
+        let rest = rest.trim();
         match cmd {
-            "CODE" => {
-                if let Some((generation, code)) = parse_assignment(rest) {
-                    self.code_generation = generation;
-                    self.code = code;
-                    println!(
-                        "\nWalsh code changed to {} in generation {}",
-                        walsh::display(&self.code),
-                        self.code_generation
-                    );
+            "HOSTS" => {
+                for h in rest.split_whitespace() {
+                    println!("{}", h);
                 }
             }
-            "HOSTS" => {
-                self.waiting = false;
-                for h in rest.split_whitespace() {
-                    if h == self.me {
-                        println!("{} (you)", h);
-                    } else {
-                        println!("{}", h);
+            "GROUPS" => {
+                if rest.is_empty() {
+                    println!("no groups, use create to open one");
+                }
+                for entry in rest.split_whitespace() {
+                    let fields: Vec<&str> = entry.split(',').collect();
+                    if let [id, owner, count] = fields[..] {
+                        println!("group {}  owner {}  members {}", id, owner, count);
                     }
                 }
             }
-            "REQ" => {
-                println!("\n{} wants to connect with you", rest);
-                self.asked_by = Some(rest.to_string());
+            "JOINED" => {
+                let mut parts = rest.split_whitespace();
+                let (Some(id), Some(code)) = (
+                    parts.next().and_then(|id| id.parse().ok()),
+                    parts.next().and_then(walsh::parse),
+                ) else {
+                    return;
+                };
+                self.reset();
+                self.group = Some(id);
+                self.code = code;
+                self.pending = parts.map(String::from).collect();
+                println!(
+                    "\rjoined group {} with Walsh code {}",
+                    id,
+                    walsh::display(&self.code)
+                );
+                self.exchange();
             }
-            "ACCEPTED" => {
-                self.waiting = false;
-                self.peer = Some(rest.to_string());
-                self.my_turn = true;
-                println!("{} accepted your request", rest);
-                println!("--- chat with {} (type exit to close) ---", rest);
+            "HELLO" => {
+                let Some((from, code)) = rest.split_once(' ') else {
+                    return;
+                };
+                let Some(code) = walsh::parse(code) else {
+                    return;
+                };
+                println!(
+                    "\rreceived Walsh code {} from {}",
+                    walsh::display(&code),
+                    from
+                );
+                self.keys.insert(from.to_string(), code);
+                let message = format!("REPLY {} {}", from, walsh::format(&self.code));
+                self.send(&message);
+                println!("sent my Walsh code to {}", from);
             }
-            "REJECTED" => {
-                self.waiting = false;
-                println!("{} rejected your request", rest);
+            "REPLY" => {
+                let Some((from, code)) = rest.split_once(' ') else {
+                    return;
+                };
+                let Some(code) = walsh::parse(code) else {
+                    return;
+                };
+                if self.current.as_deref() == Some(from) {
+                    println!(
+                        "received Walsh code {} from {}",
+                        walsh::display(&code),
+                        from
+                    );
+                    self.keys.insert(from.to_string(), code);
+                    self.exchange();
+                }
             }
-            "MSG" => {
-                let (from, text) = rest.split_once(' ').unwrap_or((rest, ""));
-                println!("{}> {}", from, text);
-                self.my_turn = true;
+            "SIGNAL" => {
+                let Some(signal) = cdma::parse_signal(rest) else {
+                    return;
+                };
+                for (host, code) in &self.keys {
+                    if let Ok(text) = cdma::decode_text(&signal, code) {
+                        println!("\r{}> {}", host, text);
+                        break;
+                    }
+                }
             }
-            "CLOSEREQ" => {
-                println!("\n{} wants to close the connection", rest);
-                self.close_by = Some(rest.to_string());
-            }
-            "CLOSED" => {
-                self.waiting = false;
-                self.peer = None;
-                println!("{} accepted", rest);
-                println!("--- connection with {} closed ---", rest);
-            }
-            "STAY" => {
-                self.waiting = false;
-                println!("{} does not want to close the connection", rest);
+            "GONE" => {
+                self.keys.remove(rest);
+                self.pending.retain(|host| host != rest);
+                println!("\r{} left the group", rest);
+                if self.current.as_deref() == Some(rest) {
+                    self.exchange();
+                }
             }
             "LEFT" => {
-                println!("\n{} left the channel", rest);
-                self.waiting = false;
-                if self.peer.as_deref() == Some(rest) {
-                    self.peer = None;
-                }
-                if self.asked_by.as_deref() == Some(rest) {
-                    self.asked_by = None;
-                }
-                if self.close_by.as_deref() == Some(rest) {
-                    self.close_by = None;
-                }
+                self.reset();
+                println!("left group {}", rest);
             }
-            "ERR" => {
-                self.waiting = false;
-                if self.peer.is_some() {
-                    self.my_turn = true;
-                }
-                println!("{}", rest);
+            "CLOSED" => {
+                self.reset();
+                println!("\rgroup {} was closed by its owner", rest);
             }
+            "ERR" => println!("\r{}", rest),
             _ => {}
         }
     }
 
     fn prompt(&self) {
-        if self.asked_by.is_some() || self.close_by.is_some() {
-            print!("accept? [y/n] ");
-        } else if self.waiting || (self.peer.is_some() && !self.my_turn) {
-            return;
-        } else if self.peer.is_some() {
-            print!("you> ");
-        } else {
-            print!("> ");
+        match self.group {
+            Some(id) => print!("group {}> ", id),
+            None => print!("> "),
         }
         let _ = io::stdout().flush();
     }
-}
-
-fn answer(line: &str) -> Option<bool> {
-    match line.to_lowercase().as_str() {
-        "y" | "yes" => Some(true),
-        "n" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-fn parse_assignment(value: &str) -> Option<(u64, Vec<i8>)> {
-    let (generation, code) = value.split_once(' ')?;
-    Some((generation.parse().ok()?, walsh::parse(code)?))
 }
 
 fn usage() -> ! {
@@ -300,20 +286,9 @@ fn main() {
         println!("wrong password, rejected by channel");
         process::exit(1);
     };
-    let mut assignment = String::new();
-    reader.read_line(&mut assignment).unwrap_or(0);
-    let Some((code_generation, code)) = assignment
-        .trim()
-        .strip_prefix("CODE ")
-        .and_then(parse_assignment)
-    else {
-        println!("channel did not assign a Walsh code");
-        process::exit(1);
-    };
     println!(
-        "joined the CDMA channel as {} with Walsh code {}, type help to see commands",
-        me,
-        walsh::display(&code)
+        "joined the CDMA channel as {}, type help to see commands",
+        me
     );
 
     let (tx, rx) = mpsc::channel();
@@ -339,14 +314,11 @@ fn main() {
 
     let mut session = Session {
         out,
-        me,
-        peer: None,
-        my_turn: false,
-        asked_by: None,
-        close_by: None,
-        waiting: false,
-        code_generation,
-        code,
+        group: None,
+        code: Vec::new(),
+        keys: BTreeMap::new(),
+        pending: VecDeque::new(),
+        current: None,
     };
     session.prompt();
     for event in rx {

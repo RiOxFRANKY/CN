@@ -1,5 +1,5 @@
 use netchat::{cdma, walsh};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 #[cfg(windows)]
 use std::ffi::c_void;
@@ -45,12 +45,19 @@ impl Logger {
     }
 }
 
+const GROUP_SIZE: usize = 8;
+
+struct Group {
+    owner: String,
+    members: HashMap<String, Vec<i8>>,
+    exchanging: Option<String>,
+}
+
 struct Bus {
     hosts: HashMap<String, TcpStream>,
-    peers: HashMap<String, String>,
-    requests: HashMap<String, String>,
-    codes: HashMap<String, Vec<i8>>,
-    generation: u64,
+    groups: BTreeMap<u32, Group>,
+    joined: HashMap<String, u32>,
+    next_group: u32,
     logger: Logger,
 }
 
@@ -58,10 +65,9 @@ impl Bus {
     fn new(logger: Logger) -> Self {
         Self {
             hosts: HashMap::new(),
-            peers: HashMap::new(),
-            requests: HashMap::new(),
-            codes: HashMap::new(),
-            generation: 0,
+            groups: BTreeMap::new(),
+            joined: HashMap::new(),
+            next_group: 0,
             logger,
         }
     }
@@ -72,80 +78,185 @@ impl Bus {
         }
     }
 
-    fn refresh_codes(&mut self) {
-        let mut names: Vec<String> = self.hosts.keys().cloned().collect();
-        names.sort();
-        let generated = walsh::codes(names.len());
-        self.generation = self.generation.wrapping_add(1).max(1);
-        self.codes.clear();
-        let mut updates = Vec::new();
-        for (name, code) in names.into_iter().zip(generated) {
-            updates.push((
-                name.clone(),
-                format!("CODE {} {}", self.generation, walsh::format(&code)),
-            ));
-            self.codes.insert(name, code);
-        }
-        for (name, message) in updates {
-            self.send(&name, &message);
-            if let Some(code) = self.codes.get(&name) {
-                self.logger.write(&format!(
-                    "{} assigned Walsh code {} in generation {}",
-                    name,
-                    walsh::display(code),
-                    self.generation
-                ));
-            }
-        }
-    }
-
-    fn find(&self, name: &str) -> Option<String> {
-        if self.hosts.contains_key(name) {
-            return Some(name.to_string());
-        }
-        let found: Vec<&String> = self
-            .hosts
-            .keys()
-            .filter(|host| host.rsplit_once(':').map(|(ip, _)| ip) == Some(name))
+    fn list_groups(&mut self, me: &str) {
+        let list: Vec<String> = self
+            .groups
+            .iter()
+            .map(|(id, group)| format!("{},{},{}", id, group.owner, group.members.len()))
             .collect();
-        if found.len() == 1 {
-            Some(found[0].clone())
-        } else {
-            None
+        self.send(me, &format!("GROUPS {}", list.join(" ")));
+    }
+
+    fn create(&mut self, me: &str) {
+        if self.joined.contains_key(me) {
+            self.send(me, "ERR you are already in a group");
+            return;
+        }
+        self.next_group += 1;
+        let id = self.next_group;
+        let code = walsh::codes(GROUP_SIZE).remove(0);
+        self.groups.insert(
+            id,
+            Group {
+                owner: me.to_string(),
+                members: HashMap::from([(me.to_string(), code.clone())]),
+                exchanging: Some(me.to_string()),
+            },
+        );
+        self.joined.insert(me.to_string(), id);
+        self.send(me, &format!("JOINED {} {}", id, walsh::format(&code)));
+        self.logger.write(&format!(
+            "{} created group {} with Walsh code {}",
+            me,
+            id,
+            walsh::display(&code)
+        ));
+    }
+
+    fn join(&mut self, me: &str, target: &str) {
+        if self.joined.contains_key(me) {
+            self.send(me, "ERR you are already in a group");
+            return;
+        }
+        let id = target
+            .parse::<u32>()
+            .ok()
+            .filter(|id| self.groups.contains_key(id))
+            .or_else(|| {
+                self.groups
+                    .iter()
+                    .find(|(_, group)| group.owner == target)
+                    .map(|(id, _)| *id)
+            });
+        let Some(id) = id else {
+            self.send(me, "ERR group not found, use group number or owner ip:port");
+            return;
+        };
+        let group = self.groups.get_mut(&id).unwrap();
+        if group.exchanging.is_some() {
+            self.send(
+                me,
+                &format!("ERR group {} is exchanging Walsh codes, try again", id),
+            );
+            return;
+        }
+        let Some(code) = walsh::codes(GROUP_SIZE)
+            .into_iter()
+            .find(|code| !group.members.values().any(|used| used == code))
+        else {
+            self.send(me, &format!("ERR group {} is full", id));
+            return;
+        };
+        let mut others: Vec<String> = group.members.keys().cloned().collect();
+        others.sort();
+        group.members.insert(me.to_string(), code.clone());
+        group.exchanging = Some(me.to_string());
+        self.joined.insert(me.to_string(), id);
+        self.send(
+            me,
+            &format!(
+                "JOINED {} {} {}",
+                id,
+                walsh::format(&code),
+                others.join(" ")
+            ),
+        );
+        self.logger.write(&format!(
+            "{} joined group {} with Walsh code {}",
+            me,
+            id,
+            walsh::display(&code)
+        ));
+    }
+
+    fn relay(&mut self, me: &str, command: &str, argument: &str) {
+        let Some((to, code)) = argument.split_once(' ') else {
+            return;
+        };
+        let Some(id) = self.joined.get(me).copied() else {
+            return;
+        };
+        if self.joined.get(to) != Some(&id) {
+            self.send(me, &format!("GONE {}", to));
+            return;
+        }
+        self.send(to, &format!("{} {} {}", command, me, code));
+        self.logger.write(&format!(
+            "{} sent its Walsh code to {} in group {}",
+            me, to, id
+        ));
+    }
+
+    fn ready(&mut self, me: &str) {
+        let Some(id) = self.joined.get(me).copied() else {
+            return;
+        };
+        if let Some(group) = self.groups.get_mut(&id)
+            && group.exchanging.as_deref() == Some(me)
+        {
+            group.exchanging = None;
+            self.logger.write(&format!(
+                "{} finished Walsh code exchange in group {}",
+                me, id
+            ));
         }
     }
 
-    fn busy(&self, host: &str) -> bool {
-        self.peers.contains_key(host)
-            || self.requests.contains_key(host)
-            || self.requests.values().any(|value| value == host)
+    fn signal(&mut self, me: &str, argument: &str) {
+        let Some(id) = self.joined.get(me).copied() else {
+            self.send(me, "ERR you are not in a group");
+            return;
+        };
+        let Some(signal) = cdma::parse_signal(argument) else {
+            self.send(me, "ERR invalid CDMA signal");
+            return;
+        };
+        let others: Vec<String> = self.groups[&id]
+            .members
+            .keys()
+            .filter(|member| member.as_str() != me)
+            .cloned()
+            .collect();
+        for other in others {
+            self.send(&other, &format!("SIGNAL {}", argument));
+        }
+        self.logger.write(&format!(
+            "{} sent {} CDMA chips to group {}",
+            me,
+            signal.len(),
+            id
+        ));
+    }
+
+    fn leave_group(&mut self, me: &str) -> Option<u32> {
+        let id = self.joined.remove(me)?;
+        let group = self.groups.get_mut(&id)?;
+        group.members.remove(me);
+        if group.exchanging.as_deref() == Some(me) {
+            group.exchanging = None;
+        }
+        let owner = group.owner == me;
+        let others: Vec<String> = group.members.keys().cloned().collect();
+        if owner {
+            self.groups.remove(&id);
+            for other in others {
+                self.joined.remove(&other);
+                self.send(&other, &format!("CLOSED {}", id));
+            }
+            self.logger.write(&format!("{} closed group {}", me, id));
+        } else {
+            for other in others {
+                self.send(&other, &format!("GONE {}", me));
+            }
+            self.logger.write(&format!("{} left group {}", me, id));
+        }
+        Some(id)
     }
 
     fn leave(&mut self, me: &str) {
+        self.leave_group(me);
         self.hosts.remove(me);
-        self.codes.remove(me);
-        let mut others = Vec::new();
-        if let Some(peer) = self.peers.remove(me) {
-            self.peers.remove(&peer);
-            others.push(peer);
-        }
-        if let Some(peer) = self.requests.remove(me) {
-            others.push(peer);
-        }
-        let target = self
-            .requests
-            .iter()
-            .find(|(_, value)| value.as_str() == me)
-            .map(|(key, _)| key.clone());
-        if let Some(target) = target {
-            self.requests.remove(&target);
-            others.push(target);
-        }
-        for other in others {
-            self.send(&other, &format!("LEFT {}", me));
-        }
         self.logger.write(&format!("{} left the channel", me));
-        self.refresh_codes();
     }
 
     fn close(&mut self) {
@@ -153,7 +264,8 @@ impl Bus {
             let _ = stream.shutdown(Shutdown::Both);
         }
         self.hosts.clear();
-        self.codes.clear();
+        self.groups.clear();
+        self.joined.clear();
     }
 }
 
@@ -165,17 +277,19 @@ struct Server {
 }
 
 impl Server {
-    fn show_codes(&self) {
+    fn show_groups(&self) {
         let bus = self.bus.lock().unwrap();
-        if bus.codes.is_empty() {
-            println!("no authenticated senders");
+        if bus.groups.is_empty() {
+            println!("no groups");
             return;
         }
-        println!("Walsh generation {}", bus.generation);
-        let mut names: Vec<&String> = bus.codes.keys().collect();
-        names.sort();
-        for name in names {
-            println!("{} {}", name, walsh::display(&bus.codes[name]));
+        for (id, group) in &bus.groups {
+            println!("group {} owner {}", id, group.owner);
+            let mut names: Vec<&String> = group.members.keys().collect();
+            names.sort();
+            for name in names {
+                println!("  {} {}", name, walsh::display(&group.members[name]));
+            }
         }
     }
 
@@ -210,9 +324,9 @@ fn main() {
         }
         match line.trim() {
             "help" => show_help(),
-            "codes" => {
+            "groups" => {
                 if let Some(active) = &server {
-                    active.show_codes();
+                    active.show_groups();
                 } else {
                     println!("channel is not running");
                 }
@@ -287,7 +401,7 @@ fn show_help() {
     println!("password   set the channel password");
     println!("start      open the CDMA channel");
     println!("stop       stop the channel, keep the shell open");
-    println!("codes      show current sender Walsh codes");
+    println!("groups     show groups and member Walsh codes");
     println!("logs       follow logs, Ctrl+C returns here");
     println!("exit       close the channel shell");
 }
@@ -489,11 +603,7 @@ fn handle(stream: TcpStream, bus: Arc<Mutex<Bus>>, password: String, logger: Log
         return;
     }
     let _ = writeln!(output, "OK {}", me);
-    {
-        let mut bus = bus.lock().unwrap();
-        bus.hosts.insert(me.clone(), output);
-        bus.refresh_codes();
-    }
+    bus.lock().unwrap().hosts.insert(me.clone(), output);
     logger.write(&format!("{} joined the CDMA channel", me));
 
     for line in lines {
@@ -501,11 +611,7 @@ fn handle(stream: TcpStream, bus: Arc<Mutex<Bus>>, password: String, logger: Log
             break;
         };
         let (command, argument) = line.split_once(' ').unwrap_or((&line, ""));
-        if command == "SIGNAL" {
-            handle_signal(&me, argument, &bus);
-            continue;
-        }
-
+        let argument = argument.trim();
         let mut bus = bus.lock().unwrap();
         match command {
             "HOSTS" => {
@@ -513,104 +619,18 @@ fn handle(stream: TcpStream, bus: Arc<Mutex<Bus>>, password: String, logger: Log
                 list.sort();
                 bus.send(&me, &format!("HOSTS {}", list.join(" ")));
             }
-            "CONNECT" => match bus.find(argument.trim()) {
-                None => bus.send(&me, "ERR host not found, use ip:port from hosts"),
-                Some(target) if target == me => {
-                    bus.send(&me, "ERR you cannot connect to yourself")
-                }
-                Some(target) if bus.busy(&target) || bus.busy(&me) => {
-                    bus.send(&me, &format!("ERR {} is busy right now", target))
-                }
-                Some(target) => {
-                    bus.requests.insert(target.clone(), me.clone());
-                    bus.send(&target, &format!("REQ {}", me));
-                    bus.logger
-                        .write(&format!("{} sent connection request to {}", me, target));
-                }
+            "GROUPS" => bus.list_groups(&me),
+            "CREATE" => bus.create(&me),
+            "JOIN" => bus.join(&me, argument),
+            "HELLO" | "REPLY" => bus.relay(&me, command, argument),
+            "READY" => bus.ready(&me),
+            "SIGNAL" => bus.signal(&me, argument),
+            "LEAVE" => match bus.leave_group(&me) {
+                Some(id) => bus.send(&me, &format!("LEFT {}", id)),
+                None => bus.send(&me, "ERR you are not in a group"),
             },
-            "ACCEPT" => {
-                if let Some(from) = bus.requests.remove(&me) {
-                    bus.peers.insert(me.clone(), from.clone());
-                    bus.peers.insert(from.clone(), me.clone());
-                    bus.send(&from, &format!("ACCEPTED {}", me));
-                    bus.logger
-                        .write(&format!("{} accepted the request of {}", me, from));
-                }
-            }
-            "REJECT" => {
-                if let Some(from) = bus.requests.remove(&me) {
-                    bus.send(&from, &format!("REJECTED {}", me));
-                    bus.logger
-                        .write(&format!("{} rejected the request of {}", me, from));
-                }
-            }
-            "EXIT" => {
-                if let Some(peer) = bus.peers.get(&me).cloned() {
-                    bus.send(&peer, &format!("CLOSEREQ {}", me));
-                    bus.logger
-                        .write(&format!("{} sent close request to {}", me, peer));
-                }
-            }
-            "CLOSEYES" => {
-                if let Some(peer) = bus.peers.remove(&me) {
-                    bus.peers.remove(&peer);
-                    bus.send(&peer, &format!("CLOSED {}", me));
-                    bus.logger.write(&format!(
-                        "connection between {} and {} closed",
-                        peer, me
-                    ));
-                }
-            }
-            "CLOSENO" => {
-                if let Some(peer) = bus.peers.get(&me).cloned() {
-                    bus.send(&peer, &format!("STAY {}", me));
-                    bus.logger
-                        .write(&format!("{} rejected the close request of {}", me, peer));
-                }
-            }
             _ => {}
         }
     }
     bus.lock().unwrap().leave(&me);
-}
-
-fn handle_signal(me: &str, argument: &str, bus: &Arc<Mutex<Bus>>) {
-    let Some((generation_text, encoded)) = argument.split_once(' ') else {
-        bus.lock().unwrap().send(me, "ERR invalid CDMA signal");
-        return;
-    };
-    let Ok(generation) = generation_text.parse::<u64>() else {
-        bus.lock().unwrap().send(me, "ERR invalid Walsh generation");
-        return;
-    };
-    let Some(signal) = cdma::parse_signal(encoded) else {
-        bus.lock().unwrap().send(me, "ERR invalid CDMA signal");
-        return;
-    };
-    let mut bus = bus.lock().unwrap();
-    if generation != bus.generation {
-        bus.send(me, "ERR Walsh code changed, send the message again");
-        return;
-    }
-    let Some(code) = bus.codes.get(me).cloned() else {
-        bus.send(me, "ERR no Walsh code assigned");
-        return;
-    };
-    let text = match cdma::decode_text(&signal, &code) {
-        Ok(text) => text,
-        Err(error) => {
-            bus.send(me, &format!("ERR {}", error));
-            return;
-        }
-    };
-    if let Some(peer) = bus.peers.get(me).cloned() {
-        bus.send(&peer, &format!("MSG {} {}", me, text));
-        bus.logger.write(&format!(
-            "{} sent {} CDMA chips to {} using Walsh code {}",
-            me,
-            signal.len(),
-            peer,
-            walsh::display(&code)
-        ));
-    }
 }
